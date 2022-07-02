@@ -4,4 +4,6 @@ openfold.egg-info/*
 tests/*
 openfold/resources/*
 dist/*
+example_files/result*
+
 
