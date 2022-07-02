@@ -163,6 +163,22 @@ def prep_output(out, batch, feature_dict, feature_processor, args):
     return unrelaxed_protein
 
 
+def load_fasta_top_seq(filename):
+    name = "";
+    seq = "";
+    with open(filename) as fin:
+        for ll in fin:
+            if ">" in ll:
+                if len(seq) > 0:
+                    break;
+                mat = re.search(r">([^\s]+)",ll);
+                if mat :
+                    name = mat.group(1);
+            else:
+                seq += re.sub(r"[\s]","",ll);
+                
+    return name, seq
+    
 def parse_fasta(data):
     data = re.sub('>$', '', data, flags=re.M)
     lines = [
@@ -186,7 +202,7 @@ def generate_feature_dict(
 ):
     if precomputed_a3m is not None:
         assert len(seqs) == 1;
-        assert len(tabs) == 1;
+        assert len(tags) == 1;
     tmp_fasta_path = os.path.join(args.output_dir, f"tmp_{os.getpid()}.fasta")
     if len(seqs) == 1:
         tag = tags[0]
@@ -195,6 +211,8 @@ def generate_feature_dict(
             fp.write(f">{tag}\n{seq}")
 
         local_alignment_dir = os.path.join(alignment_dir, tag)
+        if not os.path.exists(local_alignment_dir):
+            os.makedirs(local_alignment_dir)
         feature_dict = data_processor.process_fasta(
             fasta_path=tmp_fasta_path, alignment_dir=local_alignment_dir,precomputed_a3m = precomputed_a3m
         )
@@ -335,10 +353,11 @@ def main(args):
 
     for fasta_file in list_files_with_extensions(args.fasta_dir, (".fasta", ".fa",".a3m")):
         if re.search(r"\.a3m$",fasta_file):
-            with open(os.path.join(args.fasta_dir, fasta_file), "r") as fp:
-                data = fp.read()
-            tags, seqs = parse_fasta(data)
-             alignment_runner = data_pipeline.AlignmentRunner(
+            precomputed_a3m=os.path.join(args.fasta_dir, fasta_file);
+            
+            tag,seq = load_fasta_top_seq(precomputed_a3m);
+            
+            alignment_runner = data_pipeline.AlignmentRunner(
                 jackhmmer_binary_path=args.jackhmmer_binary_path,
                 hhblits_binary_path=args.hhblits_binary_path,
                 hhsearch_binary_path=args.hhsearch_binary_path,
@@ -349,9 +368,23 @@ def main(args):
                 pdb70_database_path=args.pdb70_database_path,
                 no_cpus=args.cpus,
             )
-            local_alignment_dir = os.path.join(alignment_dir, tag[0]);
-            alignment_runner.search_templates(fasta_file,local_alignment_dir);
+            local_alignment_dir = os.path.join(alignment_dir, tag);
             
+            if not os.path.exists(local_alignment_dir):
+                os.makedirs(local_alignment_dir)
+                
+            alignment_runner.search_templates(precomputed_a3m,local_alignment_dir);
+            feature_dict = generate_feature_dict(
+                [tag,],
+                [seq,],
+                alignment_dir,
+                data_processor,
+                args,
+                precomputed_a3m=precomputed_a3m
+            )
+            output_name = f'{tag}_{args.config_preset}'
+            if args.output_postfix is not None:
+                output_name = f'{output_name}_{args.output_postfix}'
         else:
             # Gather input sequences
             with open(os.path.join(args.fasta_dir, fasta_file), "r") as fp:

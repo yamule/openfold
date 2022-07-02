@@ -5,5 +5,4 @@ tests/*
 openfold/resources/*
 dist/*
 example_files/result*
-
-
+*__pycache__*

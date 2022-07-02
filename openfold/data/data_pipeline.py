@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import re;
 import datetime
 from multiprocessing import cpu_count
 from typing import Mapping, Optional, Sequence, Any
@@ -601,8 +602,8 @@ class DataPipeline:
                 deletion_matrices=deletion_matrices,
             )
         else:
-			with open(precomputed_a3m) as fin:
-				a3mstring = fin.read();
+            with open(precomputed_a3m) as fin:
+                a3mstring = fin.read();
             msa, deletion_matrix = parsers.parse_a3m(a3mstring);
             msa_features = make_msa_features(
                 msas=[msa,],
