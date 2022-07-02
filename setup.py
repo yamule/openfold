@@ -79,6 +79,7 @@ setup(
                 'openfold/utils/kernel/csrc/'
             )
         ],
+        extra_link_args=['-L/usr/lib/x86_64-linux-gnu/'],
         extra_compile_args={
             'cxx': ['-O3'] + version_dependent_macros,
             'nvcc': (

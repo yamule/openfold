@@ -182,7 +182,11 @@ def generate_feature_dict(
     alignment_dir,
     data_processor,
     args,
+    precomputed_a3m=None,
 ):
+    if precomputed_a3m is not None:
+        assert len(seqs) == 1;
+        assert len(tabs) == 1;
     tmp_fasta_path = os.path.join(args.output_dir, f"tmp_{os.getpid()}.fasta")
     if len(seqs) == 1:
         tag = tags[0]
@@ -192,7 +196,7 @@ def generate_feature_dict(
 
         local_alignment_dir = os.path.join(alignment_dir, tag)
         feature_dict = data_processor.process_fasta(
-            fasta_path=tmp_fasta_path, alignment_dir=local_alignment_dir
+            fasta_path=tmp_fasta_path, alignment_dir=local_alignment_dir,precomputed_a3m = precomputed_a3m
         )
     else:
         with open(tmp_fasta_path, "w") as fp:
@@ -329,28 +333,47 @@ def main(args):
         alignment_dir = args.use_precomputed_alignments
         logger.info(f"Using precomputed alignments at {alignment_dir}...")
 
-    for fasta_file in list_files_with_extensions(args.fasta_dir, (".fasta", ".fa")):
-        # Gather input sequences
-        with open(os.path.join(args.fasta_dir, fasta_file), "r") as fp:
-            data = fp.read()
+    for fasta_file in list_files_with_extensions(args.fasta_dir, (".fasta", ".fa",".a3m")):
+        if re.search(r"\.a3m$",fasta_file):
+            with open(os.path.join(args.fasta_dir, fasta_file), "r") as fp:
+                data = fp.read()
+            tags, seqs = parse_fasta(data)
+             alignment_runner = data_pipeline.AlignmentRunner(
+                jackhmmer_binary_path=args.jackhmmer_binary_path,
+                hhblits_binary_path=args.hhblits_binary_path,
+                hhsearch_binary_path=args.hhsearch_binary_path,
+                uniref90_database_path=args.uniref90_database_path,
+                mgnify_database_path=args.mgnify_database_path,
+                bfd_database_path=args.bfd_database_path,
+                uniclust30_database_path=args.uniclust30_database_path,
+                pdb70_database_path=args.pdb70_database_path,
+                no_cpus=args.cpus,
+            )
+            local_alignment_dir = os.path.join(alignment_dir, tag[0]);
+            alignment_runner.search_templates(fasta_file,local_alignment_dir);
+            
+        else:
+            # Gather input sequences
+            with open(os.path.join(args.fasta_dir, fasta_file), "r") as fp:
+                data = fp.read()
+        
+            tags, seqs = parse_fasta(data)
+            # assert len(tags) == len(set(tags)), "All FASTA tags must be unique"
+            tag = '-'.join(tags)
+        
+            output_name = f'{tag}_{args.config_preset}'
+            if args.output_postfix is not None:
+                output_name = f'{output_name}_{args.output_postfix}'
+            
+            precompute_alignments(tags, seqs, alignment_dir, args)
     
-        tags, seqs = parse_fasta(data)
-        # assert len(tags) == len(set(tags)), "All FASTA tags must be unique"
-        tag = '-'.join(tags)
-    
-        output_name = f'{tag}_{args.config_preset}'
-        if args.output_postfix is not None:
-            output_name = f'{output_name}_{args.output_postfix}'
-
-        precompute_alignments(tags, seqs, alignment_dir, args)
-    
-        feature_dict = generate_feature_dict(
-            tags,
-            seqs,
-            alignment_dir,
-            data_processor,
-            args,
-        )
+            feature_dict = generate_feature_dict(
+                tags,
+                seqs,
+                alignment_dir,
+                data_processor,
+                args,
+            )
 
         processed_feature_dict = feature_processor.process_features(
             feature_dict, mode='predict',

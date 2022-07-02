@@ -395,7 +395,19 @@ class AlignmentRunner:
                 databases=[pdb70_database_path],
                 n_cpu=no_cpus,
             )
-
+    def search_templates(self,a3m_file:str,output_dir):
+        if(self.hhsearch_pdb70_runner is not None):
+            with open(a3m_file) as fin:
+                 uniref90_msa_as_a3m = fin.read();
+            if re.search(r"\n$",uniref90_msa_as_a3m) is None:
+                uniref90_msa_as_a3m += "\n";
+            hhsearch_result = self.hhsearch_pdb70_runner.query(
+                uniref90_msa_as_a3m
+            )
+            pdb70_out_path = os.path.join(output_dir, "pdb70_hits.hhr")
+            with open(pdb70_out_path, "w") as f:
+                f.write(hhsearch_result)
+                
     def run(
         self,
         fasta_path: str,
@@ -551,8 +563,9 @@ class DataPipeline:
         alignment_dir: str,
         input_sequence: Optional[str] = None,
         _alignment_index: Optional[str] = None,
+        precomputed_a3m: Optional[str] = None,
     ):
-        msa_data = self._parse_msa_data(alignment_dir, _alignment_index)
+        msa_data = self._parse_msa_data(alignment_dir, _alignment_index,precomputed_a3m=precomputed_a3m)
         if(len(msa_data) == 0):
             if(input_sequence is None):
                 raise ValueError(
@@ -576,22 +589,32 @@ class DataPipeline:
         self,
         alignment_dir: str,
         input_sequence: Optional[str] = None,
-        _alignment_index: Optional[str] = None
+        _alignment_index: Optional[str] = None,
+        precomputed_a3m: Optional[str] = None
     ) -> Mapping[str, Any]:
-        msas, deletion_matrices = self._get_msas(
-            alignment_dir, input_sequence, _alignment_index
-        )
-        msa_features = make_msa_features(
-            msas=msas,
-            deletion_matrices=deletion_matrices,
-        )
-
+        if precomputed_a3m is None:
+            msas, deletion_matrices = self._get_msas(
+                alignment_dir, input_sequence, _alignment_index
+            )
+            msa_features = make_msa_features(
+                msas=msas,
+                deletion_matrices=deletion_matrices,
+            )
+        else:
+			with open(precomputed_a3m) as fin:
+				a3mstring = fin.read();
+            msa, deletion_matrix = parsers.parse_a3m(a3mstring);
+            msa_features = make_msa_features(
+                msas=[msa,],
+                deletion_matrices=[deletion_matrix,],
+            )
         return msa_features
 
     def process_fasta(
         self,
         fasta_path: str,
         alignment_dir: str,
+        precomputed_a3m: Optional[str] = None,
         _alignment_index: Optional[str] = None,
     ) -> FeatureDict:
         """Assembles features for a single sequence in a FASTA file""" 
@@ -606,11 +629,11 @@ class DataPipeline:
         input_description = input_descs[0]
         num_res = len(input_sequence)
 
-        hits = self._parse_template_hits(alignment_dir, _alignment_index)
+        hits = self._parse_template_hits(alignment_dir, _alignment_index,)
         template_features = make_template_features(
             input_sequence,
             hits,
-            self.template_featurizer,
+            self.template_featurizer
         )
 
         sequence_features = make_sequence_features(
@@ -619,7 +642,9 @@ class DataPipeline:
             num_res=num_res,
         )
 
-        msa_features = self._process_msa_feats(alignment_dir, input_sequence, _alignment_index)
+        msa_features = self._process_msa_feats(alignment_dir, input_sequence
+        , _alignment_index
+        ,precomputed_a3m=precomputed_a3m)
         
         return {
             **sequence_features,

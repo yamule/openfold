@@ -1,0 +1,7 @@
+build/*
+lib/*
+openfold.egg-info/*
+tests/*
+openfold/resources/*
+dist/*
+
