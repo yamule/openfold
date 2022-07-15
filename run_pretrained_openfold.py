@@ -392,13 +392,13 @@ def main(args):
     tag_list = []
     seq_list = []
     a3m_list = []
-    for fasta_file in list_files_with_extensions(args.fasta_dir, (".fasta", ".fa",".a3m"): #,".a3m.gz")): mada
+    for fasta_file in list_files_with_extensions(args.fasta_dir, (".fasta", ".fa",".a3m")): #,".a3m.gz")): mada
         if re.search(r"\.a3m(\.gz)?$",fasta_file):
-            precomputed_a3m=os.path.join(args.fasta_dir, fasta_file);
-            tag,seq = load_fasta_top_seq(precomputed_a3m);
-            tag_list.append(tag)
-            seq_list.append(seqs)
-            a3m_list.append(precomputed_a3m);
+            a3mm=os.path.join(args.fasta_dir, fasta_file);
+            tag,seq = load_fasta_top_seq(a3mm);
+            tag_list.append([tag])
+            seq_list.append([seq])
+            a3m_list.append(a3mm);
         else:
             # Gather input sequences
             with open(os.path.join(args.fasta_dir, fasta_file), "r") as fp:
@@ -406,9 +406,9 @@ def main(args):
         
             tags, seqs = parse_fasta(data)
             # assert len(tags) == len(set(tags)), "All FASTA tags must be unique"
-            tag = '-'.join(tags)
+            
 
-            tag_list.append(tag)
+            tag_list.append(tags)
             seq_list.append(seqs)
             a3m_list.append("");
 
@@ -417,11 +417,14 @@ def main(args):
     feature_dicts = []
     for model, output_directory in load_models_from_command_line(args, config): 
         cur_tracing_interval = 0
-        for sii, tag, seqs, a3m_file in enumerate(sorted_targets):
+        for (sii, (tags, seqs, a3m_file)) in enumerate(sorted_targets):
+            
+            tag = '-'.join(tags)
             if len(feature_dicts) > sii:
                 feature_dict = feature_dicts[sii];
             else:
                 if len(a3m_file) > 0:
+                    print(a3m_file,"=============");
                     alignment_runner = data_pipeline.AlignmentRunner(
                         jackhmmer_binary_path=args.jackhmmer_binary_path,
                         hhblits_binary_path=args.hhblits_binary_path,
@@ -438,14 +441,14 @@ def main(args):
                     if not os.path.exists(local_alignment_dir):
                         os.makedirs(local_alignment_dir)
                         
-                    alignment_runner.search_templates(precomputed_a3m,local_alignment_dir);
+                    alignment_runner.search_templates(a3m_file,local_alignment_dir);
                     feature_dict = generate_feature_dict(
-                        [tag,],
-                        [seq,],
+                        tags,
+                        seqs,
                         alignment_dir,
                         data_processor,
                         args,
-                        precomputed_a3m=precomputed_a3m
+                        precomputed_a3m=a3m_file
                     )
                     output_name = f'{tag}_{args.config_preset}'
                     if args.output_postfix is not None:
