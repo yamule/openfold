@@ -12,14 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 import argparse
+from copy import deepcopy
 from datetime import date
-import gc
 import logging
+import math
 import numpy as np
 import os
-from copy import deepcopy
+
+logging.basicConfig()
+logger = logging.getLogger(__file__)
+logger.setLevel(level=logging.INFO)
 
 import pickle
 from pytorch_lightning.utilities.deepspeed import (
@@ -31,7 +34,19 @@ import time
 import torch
 import re
 
-from openfold.config import model_config
+torch_versions = torch.__version__.split(".")
+torch_major_version = int(torch_versions[0])
+torch_minor_version = int(torch_versions[1])
+if(
+    torch_major_version > 1 or 
+    (torch_major_version == 1 and torch_minor_version >= 12)
+):
+    # Gives a large speedup on Ampere-class GPUs
+    torch.set_float32_matmul_precision("high")
+
+torch.set_grad_enabled(False)
+
+from openfold.config import model_config, NUM_RES
 from openfold.data import templates, feature_pipeline, data_pipeline
 from openfold.model.model import AlphaFold
 from openfold.model.torchscript import script_preset_
@@ -43,13 +58,14 @@ from openfold.utils.import_weights import (
 from openfold.utils.tensor_utils import (
     tensor_tree_map,
 )
-
+from openfold.utils.trace_utils import (
+    pad_feature_dict_seq,
+    trace_model_,
+)
 from scripts.utils import add_data_args
 
 
-logging.basicConfig()
-logger = logging.getLogger(__file__)
-logger.setLevel(level=logging.INFO)
+TRACING_INTERVAL = 50
 
 
 def precompute_alignments(tags, seqs, alignment_dir, args):
@@ -59,10 +75,10 @@ def precompute_alignments(tags, seqs, alignment_dir, args):
             fp.write(f">{tag}\n{seq}")
 
         local_alignment_dir = os.path.join(alignment_dir, tag)
-        if(args.use_precomputed_alignments is None):
+        if(args.use_precomputed_alignments is None and not os.path.isdir(local_alignment_dir)):
             logger.info(f"Generating alignments for {tag}...")
-            if not os.path.exists(local_alignment_dir):
-                os.makedirs(local_alignment_dir)
+                
+            os.makedirs(local_alignment_dir)
 
             alignment_runner = data_pipeline.AlignmentRunner(
                 jackhmmer_binary_path=args.jackhmmer_binary_path,
@@ -78,18 +94,21 @@ def precompute_alignments(tags, seqs, alignment_dir, args):
             alignment_runner.run(
                 tmp_fasta_path, local_alignment_dir
             )
+        else:
+            logger.info(
+                f"Using precomputed alignments for {tag} at {alignment_dir}..."
+            )
 
         # Remove temporary FASTA file
         os.remove(tmp_fasta_path)
 
 
+def round_up_seqlen(seqlen):
+    return int(math.ceil(seqlen / TRACING_INTERVAL)) * TRACING_INTERVAL
+
+
 def run_model(model, batch, tag, args):
-    with torch.no_grad():
-        batch = {
-            k:torch.as_tensor(v, device=args.model_device) 
-            for k,v in batch.items()
-        }
- 
+    with torch.no_grad(): 
         # Disable templates if there aren't any in the batch
         model.config.template.enabled = model.config.template.enabled and any([
             "template_" in k for k in batch
@@ -99,7 +118,7 @@ def run_model(model, batch, tag, args):
         t = time.perf_counter()
         out = model(batch)
         logger.info(f"Inference time: {time.perf_counter() - t}")
-    
+   
     return out
 
 
@@ -110,6 +129,9 @@ def prep_output(out, batch, feature_dict, feature_processor, args):
     plddt_b_factors = np.repeat(
         plddt[..., None], residue_constants.atom_type_num, axis=-1
     )
+
+    if(args.subtract_plddt):
+        plddt_b_factors = 100 - plddt_b_factors
 
     # Prep protein metadata
     template_domain_names = []
@@ -230,12 +252,14 @@ def generate_feature_dict(
 
     return feature_dict
 
+
 def get_model_basename(model_path):
     return os.path.splitext(
                 os.path.basename(
                     os.path.normpath(model_path)
                 )
             )[0]
+
 
 def make_output_directory(output_dir, model_name, multiple_model_mode):
     if multiple_model_mode:
@@ -245,6 +269,7 @@ def make_output_directory(output_dir, model_name, multiple_model_mode):
     os.makedirs(prediction_dir, exist_ok=True)
     return prediction_dir
 
+
 def count_models_to_evaluate(openfold_checkpoint_path, jax_param_path):
     model_count = 0
     if openfold_checkpoint_path:
@@ -252,6 +277,7 @@ def count_models_to_evaluate(openfold_checkpoint_path, jax_param_path):
     if jax_param_path:
         model_count += len(jax_param_path.split(","))
     return model_count
+
 
 def load_models_from_command_line(args, config):
     # Create the output directory
@@ -317,14 +343,23 @@ def load_models_from_command_line(args, config):
             "be specified."
         )
 
+
 def list_files_with_extensions(dir, extensions):
     return [f for f in os.listdir(dir) if f.endswith(extensions)]
+
 
 def main(args):
     # Create the output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
     config = model_config(args.config_preset)
+    
+    if(args.trace_model):
+        if(not config.data.predict.fixed_size):
+            raise ValueError(
+                "Tracing requires that fixed_size mode be enabled in the config"
+            )
+    
     template_featurizer = templates.TemplateHitFeaturizer(
         mmcif_dir=args.template_mmcif_dir,
         max_template_date=args.max_template_date,
@@ -341,7 +376,11 @@ def main(args):
     output_dir_base = args.output_dir
     random_seed = args.data_random_seed
     if random_seed is None:
-        random_seed = random.randrange(sys.maxsize)
+        random_seed = random.randrange(2**32)
+    
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed + 1)
+    
     feature_processor = feature_pipeline.FeaturePipeline(config.data)
     if not os.path.exists(output_dir_base):
         os.makedirs(output_dir_base)
@@ -349,42 +388,17 @@ def main(args):
         alignment_dir = os.path.join(output_dir_base, "alignments")
     else:
         alignment_dir = args.use_precomputed_alignments
-        logger.info(f"Using precomputed alignments at {alignment_dir}...")
 
-    for fasta_file in list_files_with_extensions(args.fasta_dir, (".fasta", ".fa",".a3m")):
-        if re.search(r"\.a3m$",fasta_file):
+    tag_list = []
+    seq_list = []
+    a3m_list = []
+    for fasta_file in list_files_with_extensions(args.fasta_dir, (".fasta", ".fa",".a3m"): #,".a3m.gz")): mada
+        if re.search(r"\.a3m(\.gz)?$",fasta_file):
             precomputed_a3m=os.path.join(args.fasta_dir, fasta_file);
-            
             tag,seq = load_fasta_top_seq(precomputed_a3m);
-            
-            alignment_runner = data_pipeline.AlignmentRunner(
-                jackhmmer_binary_path=args.jackhmmer_binary_path,
-                hhblits_binary_path=args.hhblits_binary_path,
-                hhsearch_binary_path=args.hhsearch_binary_path,
-                uniref90_database_path=args.uniref90_database_path,
-                mgnify_database_path=args.mgnify_database_path,
-                bfd_database_path=args.bfd_database_path,
-                uniclust30_database_path=args.uniclust30_database_path,
-                pdb70_database_path=args.pdb70_database_path,
-                no_cpus=args.cpus,
-            )
-            local_alignment_dir = os.path.join(alignment_dir, tag);
-            
-            if not os.path.exists(local_alignment_dir):
-                os.makedirs(local_alignment_dir)
-                
-            alignment_runner.search_templates(precomputed_a3m,local_alignment_dir);
-            feature_dict = generate_feature_dict(
-                [tag,],
-                [seq,],
-                alignment_dir,
-                data_processor,
-                args,
-                precomputed_a3m=precomputed_a3m
-            )
-            output_name = f'{tag}_{args.config_preset}'
-            if args.output_postfix is not None:
-                output_name = f'{output_name}_{args.output_postfix}'
+            tag_list.append(tag)
+            seq_list.append(seqs)
+            a3m_list.append(precomputed_a3m);
         else:
             # Gather input sequences
             with open(os.path.join(args.fasta_dir, fasta_file), "r") as fp:
@@ -393,44 +407,115 @@ def main(args):
             tags, seqs = parse_fasta(data)
             # assert len(tags) == len(set(tags)), "All FASTA tags must be unique"
             tag = '-'.join(tags)
-        
-            output_name = f'{tag}_{args.config_preset}'
-            if args.output_postfix is not None:
-                output_name = f'{output_name}_{args.output_postfix}'
+
+            tag_list.append(tag)
+            seq_list.append(seqs)
+            a3m_list.append("");
+
+    seq_sort_fn = lambda target: sum([len(s) for s in target[1]])
+    sorted_targets = sorted(zip(tag_list, seq_list, a3m_list), key=seq_sort_fn)
+    feature_dicts = []
+    for model, output_directory in load_models_from_command_line(args, config): 
+        cur_tracing_interval = 0
+        for sii, tag, seqs, a3m_file in enumerate(sorted_targets):
+            if len(feature_dicts) > sii:
+                feature_dict = feature_dicts[sii];
+            else:
+                if len(a3m_file) > 0:
+                    alignment_runner = data_pipeline.AlignmentRunner(
+                        jackhmmer_binary_path=args.jackhmmer_binary_path,
+                        hhblits_binary_path=args.hhblits_binary_path,
+                        hhsearch_binary_path=args.hhsearch_binary_path,
+                        uniref90_database_path=args.uniref90_database_path,
+                        mgnify_database_path=args.mgnify_database_path,
+                        bfd_database_path=args.bfd_database_path,
+                        uniclust30_database_path=args.uniclust30_database_path,
+                        pdb70_database_path=args.pdb70_database_path,
+                        no_cpus=args.cpus,
+                    )
+                    local_alignment_dir = os.path.join(alignment_dir, tag);
+                    
+                    if not os.path.exists(local_alignment_dir):
+                        os.makedirs(local_alignment_dir)
+                        
+                    alignment_runner.search_templates(precomputed_a3m,local_alignment_dir);
+                    feature_dict = generate_feature_dict(
+                        [tag,],
+                        [seq,],
+                        alignment_dir,
+                        data_processor,
+                        args,
+                        precomputed_a3m=precomputed_a3m
+                    )
+                    output_name = f'{tag}_{args.config_preset}'
+                    if args.output_postfix is not None:
+                        output_name = f'{output_name}_{args.output_postfix}'
+                else:
+                    output_name = f'{tag}_{args.config_preset}'
+                    if args.output_postfix is not None:
+                        output_name = f'{output_name}_{args.output_postfix}'
             
-            precompute_alignments(tags, seqs, alignment_dir, args)
-    
-            feature_dict = generate_feature_dict(
-                tags,
-                seqs,
-                alignment_dir,
-                data_processor,
-                args,
+                    # Does nothing if the alignments have already been computed
+                    precompute_alignments(tags, seqs, alignment_dir, args)
+            
+                    feature_dict = generate_feature_dict(
+                        tags,
+                        seqs,
+                        alignment_dir,
+                        data_processor,
+                        args,
+                    )
+
+                    if(args.trace_model):
+                        n = feature_dict["aatype"].shape[-2]
+                        rounded_seqlen = round_up_seqlen(n)
+                        feature_dict = pad_feature_dict_seq(
+                            feature_dict, rounded_seqlen,
+                        )
+
+                feature_dicts.append(feature_dict);
+
+            processed_feature_dict = feature_processor.process_features(
+                feature_dict, mode='predict',
             )
 
-        processed_feature_dict = feature_processor.process_features(
-            feature_dict, mode='predict',
-        )
+            processed_feature_dict = {
+                k:torch.as_tensor(v, device=args.model_device) 
+                for k,v in processed_feature_dict.items()
+            }
 
-        for model, output_directory in load_models_from_command_line(args, config):
-            working_batch = deepcopy(processed_feature_dict)
-            out = run_model(model, working_batch, tag, args)
+            if(args.trace_model):
+                if(rounded_seqlen > cur_tracing_interval):
+                    logger.info(
+                        f"Tracing model at {rounded_seqlen} residues..."
+                    )
+                    t = time.perf_counter()
+                    trace_model_(model, processed_feature_dict)
+                    logger.info(
+                        f"Tracing time: {time.perf_counter() - t}"
+                    )
+                    cur_tracing_interval = rounded_seqlen
+
+            out = run_model(model, processed_feature_dict, tag, args)
 
             # Toss out the recycling dimensions --- we don't need them anymore
-            working_batch = tensor_tree_map(lambda x: np.array(x[..., -1].cpu()), working_batch)
+            processed_feature_dict = tensor_tree_map(
+                lambda x: np.array(x[..., -1].cpu()), 
+                processed_feature_dict
+            )
             out = tensor_tree_map(lambda x: np.array(x.cpu()), out)
 
             unrelaxed_protein = prep_output(
-                out, working_batch, feature_dict, feature_processor, args
+                out, 
+                processed_feature_dict, 
+                feature_dict, 
+                feature_processor, 
+                args
             )
 
             unrelaxed_output_path = os.path.join(
                 output_directory, f'{output_name}_unrelaxed.pdb'
             )
-
-            # Output already exists
-            if os.path.exists(unrelaxed_output_path):
-                continue
 
             with open(unrelaxed_output_path, 'w') as fp:
                 fp.write(protein.to_pdb(unrelaxed_protein))
@@ -536,6 +621,17 @@ if __name__ == "__main__":
     parser.add_argument(
         "--multimer_ri_gap", type=int, default=200,
         help="""Residue index offset between multiple sequences, if provided"""
+    )
+    parser.add_argument(
+        "--trace_model", action="store_true", default=False,
+        help="""Whether to convert parts of each model to TorchScript.
+                Significantly improves runtime at the cost of lengthy
+                'compilation.' Useful for large batch jobs."""
+    )
+    parser.add_argument(
+        "--subtract_plddt", action="store_true", default=False,
+        help=""""Whether to output (100 - pLDDT) in the B-factor column instead
+                 of the pLDDT itself"""
     )
     add_data_args(parser)
     args = parser.parse_args()

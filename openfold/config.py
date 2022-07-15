@@ -1,4 +1,5 @@
 import copy
+import importlib
 import ml_collections as mlc
 
 
@@ -23,7 +24,11 @@ def enforce_config_constraints(config):
         (
             "model.template.average_templates", 
             "model.template.offload_templates"
-        )
+        ),
+        (
+            "globals.use_lma",
+            "globals.use_flash",
+        ),
     ]
 
     for s1, s2 in mutually_exclusive_bools:
@@ -31,6 +36,10 @@ def enforce_config_constraints(config):
         s2_setting = string_to_setting(s2)
         if(s1_setting and s2_setting):
             raise ValueError(f"Only one of {s1} and {s2} may be set at a time")
+
+    fa_is_installed = importlib.util.find_spec("flash_attn") is not None
+    if(config.globals.use_flash and not fa_is_installed):
+        raise ValueError("use_flash requires that FlashAttention is installed")
 
 
 def model_config(name, train=False, low_prec=False):
@@ -49,6 +58,24 @@ def model_config(name, train=False, low_prec=False):
         c.data.train.max_extra_msa = 5120
         c.data.train.crop_size = 384
         c.data.train.max_msa_clusters = 512
+        c.loss.violation.weight = 1.
+        c.loss.experimentally_resolved.weight = 0.01
+        c.model.heads.tm.enabled = True
+        c.loss.tm.weight = 0.1
+    elif name == "finetuning_no_templ":
+        # AF2 Suppl. Table 4, "finetuning" setting
+        c.data.train.max_extra_msa = 5120
+        c.data.train.crop_size = 384
+        c.data.train.max_msa_clusters = 512
+        c.model.template.enabled = False
+        c.loss.violation.weight = 1.
+        c.loss.experimentally_resolved.weight = 0.01
+    elif name == "finetuning_no_templ_ptm":
+        # AF2 Suppl. Table 4, "finetuning" setting
+        c.data.train.max_extra_msa = 5120
+        c.data.train.crop_size = 384
+        c.data.train.max_msa_clusters = 512
+        c.model.template.enabled = False
         c.loss.violation.weight = 1.
         c.loss.experimentally_resolved.weight = 0.01
         c.model.heads.tm.enabled = True
@@ -315,7 +342,12 @@ config = mlc.ConfigDict(
         "globals": {
             "blocks_per_ckpt": blocks_per_ckpt,
             "chunk_size": chunk_size,
+            # Use Staats & Rabe's low-memory attention algorithm. Mutually
+            # exclusive with use_flash.
             "use_lma": False,
+            # Use FlashAttention in selected modules. Mutually exclusive with 
+            # use_lma.
+            "use_flash": False,
             "offload_inference": False,
             "c_z": c_z,
             "c_m": c_m,
